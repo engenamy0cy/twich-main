@@ -15,6 +15,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import (Mapped,Session,mapped_column,DeclarativeBase,sessionmaker)
 
 
+
+load_dotenv()
 SECRET_KEY = os.environ['JWT_SECRET_KEY']
 ALGORITHM="H256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30 
@@ -52,12 +54,12 @@ def get_db():
         yield db
 
 
-DbSession = Annotated(Session,Depends(get_db))
+DbSession = Annotated[Session,Depends(get_db)]
 
 
 #Shecmy 
 class UserCreate(BaseModel):
-    emeil:EmailStr
+    email:EmailStr
     password:str = Field(
         min_length=8,
         max_length=128
@@ -91,73 +93,66 @@ def create_acces_token(user_id:int)->str:
     )
     return token
 
-# Проверка авторизации пользователя
+# проверка авторизации пользователя
+# 
 
-def get_cerrent_user(token:Annotated[str,Depends(oauth2_cheme)],db:DbSession) -> User:
+def get_cerrent_user(token:Annotated[str,Depends(oauth2_cheme)],db:DbSession)-> UserORM:
+
     error = HTTPException(
-        status_code = status.HTTP_401_UNAUTHORIZED,
-        detail = "Недействительный код или токен просрочен",
-        headers = {"WWW-Authenticate":"Bearer"},
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="недействительный токен или просрочен",
+        headers={"WWW-Authenticate":"Bearer"}
     )
     try:
         payload = jwt.decode(
             token,
             SECRET_KEY,
-            algoritms = [ALGORITHM],
-            oprions = {"require":["sub","exp"]},
+            algorithms=[ALGORITHM],
+            options={"require":["sub","exp"]}
         )
-
         user_id = int(payload["sub"])
-    except (InvalidTokenError, ValueError, TypeError):
+
+    except (InvalidTokenError,ValueError,TypeError):
         raise error from None
 
     user = db.get(UserORM,user_id)
 
     if user is None:
-        raise error
+        return error
 
-    return user
+    return user 
 
-Currentuser = Annotated(UserORM, Depends(get_cerrent_user))
+Cuerrentuser = Annotated[UserORM,Depends(get_cerrent_user)]
 
-
-# ЗАпуск приложения
 @asynccontextmanager
-async def lifespan (app:FastAPI):
-    Base.metadata.create_all(bind = engine)
+async def lifespan(app:FastAPI):
+    Base.metadata.create_all(bind=engine)
     yield
 
-app = FastAPI(
-    title = "Authentication API",
-    version = "1.0.0",
-    lifespan = lifespan
-)
+
+
+
+app = FastAPI(title="Authenfication API",version="1.0.0",lifespan=lifespan)
+
 
 @app.get("/")
 def home():
-    return("message:Fastapi работает")
+    return "fsdsfd"
 
-# Регистрация отдельно
-@app.post(
-    "/register",
-    responce_model = UserResponse,
-    status_code = status.HTTP_201_CREATED,
-)
-
-def register(data:UserCreate,db:DbSession):
+@app.post("/register",response_model=UserResponse,status_code=status.HTTP_201_CREATED)
+def register(data:UserCreate, db:DbSession):
     email = str(data.email).strip().lower()
 
-    existing_user = db.scalar(select(UserORM).where(UserORM.email == email))
-
+    existing_user = db.scalar(select(UserORM).where(UserORM.email==email))
     if existing_user is not None:
         raise HTTPException(
-            status_code = 409,
-            detail = "email уже сушествует"
+            status_code=409,
+            detail="email сущ"
         )
     
-    hashed_password = password_hash.hash(data.password)
+    hashed_password=password_hash.hash(data.password)
     new_user = UserORM(
-        email = email,
+        email=email,
         hashed_password = hashed_password
     )
     db.add(new_user)
@@ -166,9 +161,38 @@ def register(data:UserCreate,db:DbSession):
     except IntegrityError:
         db.rollback()
         raise HTTPException(
-            status_code = 409,
-            detail = "Email уже зарегестрирован"
+            status_code=409,
+            detail="Email есть"
         )from None
+
     db.refresh(new_user)
 
     return new_user
+
+
+@app.post("/login/", response_model=TokenResponse)
+def login(form: Annotated[OAuth2PasswordRequestForm, Depends()], db: DbSession):
+    email = form.username.strip().lower()
+    user = db.scalar(select(UserORM).where(UserORM.email==email))
+
+    if user is None or not password_hash.verify(form.password,user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="неверный логин или пароль",
+            headers={"WWW-Authenticate":"Bearer"}
+        )
+
+    token = create_acces_token(user.id)
+
+    return TokenResponse(
+        access_toke=token,
+        token_type="bearer"
+    )
+
+
+@app.get(
+    "/me",
+    response_model=UserResponse
+)
+def get_profile(current_user:Cuerrentuser):
+    return current_user
