@@ -13,15 +13,16 @@ from pydantic import BaseModel,ConfigDict,EmailStr,Field
 from sqlalchemy import String,create_engine,select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import (Mapped,Session,mapped_column,DeclarativeBase,sessionmaker)
+from fastapi.middleware.cors import CORSMiddleware
 
 
 
 load_dotenv()
 SECRET_KEY = os.environ['JWT_SECRET_KEY']
-ALGORITHM="H256"
+ALGORITHM="HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30 
 password_hash = PasswordHash.recommended()
-oauth2_cheme = OAuth2PasswordBearer(tokenUrl="login")
+oauth2_cheme = OAuth2PasswordBearer(tokenUrl="/login")
 
 
 # база данных подлкючение создание 
@@ -71,7 +72,7 @@ class UserResponse(BaseModel):
     model_config=ConfigDict(from_attributes=True)
 
 class TokenResponse(BaseModel):
-    acces_token:str
+    access_token:str
     token_type:str
 
 # создание jwt 
@@ -118,8 +119,7 @@ def get_cerrent_user(token:Annotated[str,Depends(oauth2_cheme)],db:DbSession)-> 
     user = db.get(UserORM,user_id)
 
     if user is None:
-        return error
-
+        raise error
     return user 
 
 Cuerrentuser = Annotated[UserORM,Depends(get_cerrent_user)]
@@ -134,6 +134,15 @@ async def lifespan(app:FastAPI):
 
 app = FastAPI(title="Authenfication API",version="1.0.0",lifespan=lifespan)
 
+
+# ОТКРЫТЬ ВСЕ CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
 
 @app.get("/")
 def home():
@@ -170,22 +179,28 @@ def register(data:UserCreate, db:DbSession):
     return new_user
 
 
-@app.post("/login/", response_model=TokenResponse)
+@app.post("/login", response_model=TokenResponse)
 def login(form: Annotated[OAuth2PasswordRequestForm, Depends()], db: DbSession):
     email = form.username.strip().lower()
     user = db.scalar(select(UserORM).where(UserORM.email==email))
 
-    if user is None or not password_hash.verify(form.password,user.hashed_password):
+    if user is None:
+        password_hash.verify(form.password,password_hash.hash("dummy"))
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="неверный логин или пароль",
+            detail="неверный логин пароль",
+            headers={"WWW-Authenticate":"Bearer"}
+        )
+    if not password_hash.verify(form.password,user.hashed_password):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="неверный логин пароль",
             headers={"WWW-Authenticate":"Bearer"}
         )
 
     token = create_acces_token(user.id)
-
     return TokenResponse(
-        access_toke=token,
+        access_token=token,
         token_type="bearer"
     )
 
@@ -196,3 +211,6 @@ def login(form: Annotated[OAuth2PasswordRequestForm, Depends()], db: DbSession):
 )
 def get_profile(current_user:Cuerrentuser):
     return current_user
+
+if __name__ == "__main__":
+    uvicorn.run("main:app",host="127.0.0.1",port=8000,reload=True)
