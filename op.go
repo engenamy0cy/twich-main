@@ -1,94 +1,107 @@
 package main
 
 import (
-    "fmt"
-    "net/http"
-    "os"
-    "sync"
+	"fmt"
+	"log"
+	"net/http"
+	"os"
+	"sync"
 
-    "://github.com"
-    "://github.com"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/gorilla/websocket"
+	"github.com/joho/godotenv"
 )
-
-var secretKey = []byte(getEnv("JWT_SECRET_KEY", "my_super_secret_key_12345"))
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
-var (
-	clients = make(map[*websocket.Conn]string)
-	mu      sync.Mutex
-)
+var jwtSecret []byte
 
-type Message struct {
+type ChatMessage struct {
 	User string `json:"user"`
 	Text string `json:"text"`
 }
 
-func getEnv(key, fallback string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return fallback
-}
+var (
+	clients   = make(map[*websocket.Conn]string)
+	clientsMu sync.Mutex
+)
 
-func parseToken(tokenStr string) (string, error) {
+func getUserFromToken(tokenStr string) (string, error) {
 	token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (interface{}, error) {
-		return secretKey, nil
+		return jwtSecret, nil
 	})
 	if err != nil || !token.Valid {
-		return "", fmt.Errorf("invalid token")
+		return "", fmt.Errorf("неверный токен")
 	}
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
-		return "", fmt.Errorf("invalid claims")
+
+	if claims, ok := token.Claims.(jwt.MapClaims); ok {
+		if email, exists := claims["email"].(string); exists {
+			return email, nil
+		}
+		if sub, exists := claims["sub"]; exists {
+			return fmt.Sprintf("User #%v", sub), nil
+		}
 	}
-	sub, _ := claims["sub"].(string)
-	return sub, nil
+	return "Аноним", nil
 }
 
-func handleWS(w http.ResponseWriter, r *http.Request) {
-	tokenStr := r.URL.Query().Get("token")
-	userID, err := parseToken(tokenStr)
+func handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	token := r.URL.Query().Get("token")
+	username, err := getUserFromToken(token)
 	if err != nil {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		http.Error(w, "Ошибка авторизации", http.StatusUnauthorized)
 		return
 	}
 
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
+		log.Println("Ошибка Upgrade:", err)
 		return
 	}
 	defer conn.Close()
 
-	mu.Lock()
-	clients[conn] = userID
-	mu.Unlock()
+	clientsMu.Lock()
+	clients[conn] = username
+	clientsMu.Unlock()
 
 	defer func() {
-		mu.Lock()
+		clientsMu.Lock()
 		delete(clients, conn)
-		mu.Unlock()
+		clientsMu.Unlock()
 	}()
 
 	for {
-		var msg Message
+		var msg ChatMessage
 		if err := conn.ReadJSON(&msg); err != nil {
 			break
 		}
-		msg.User = "User #" + userID
-
-		mu.Lock()
-		for client := range clients {
-			client.WriteJSON(msg)
+		if msg.Text == "" {
+			continue
 		}
-		mu.Unlock()
+		msg.User = username
+
+		clientsMu.Lock()
+		for client := range clients {
+			_ = client.WriteJSON(msg)
+		}
+		clientsMu.Unlock()
 	}
 }
 
 func main() {
-	http.HandleFunc("/ws", handleWS)
-	fmt.Println("Go сервер запущен на http://127.0.0.1:8080")
-	http.ListenAndServe(":8080", nil)
+	if err := godotenv.Load(); err != nil {
+		log.Println("Файл .env не найден, читаем системные переменные")
+	}
+
+	secret := os.Getenv("JWT_SECRET_KEY")
+	if secret == "" {
+		log.Fatal("Ошибка: переменная JWT_SECRET_KEY пустая!")
+	}
+	jwtSecret = []byte(secret)
+
+	http.HandleFunc("/ws", handleWebSocket)
+	fmt.Println("Чат-сервер запущен на :8080")
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
