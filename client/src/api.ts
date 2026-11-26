@@ -2,7 +2,7 @@
 import axios, { AxiosError } from "axios"
 
 export const api = axios.create({
-    baseURL:"http://127.0.0.1:8000",
+    baseURL:"https://c7nnk5w3-8000.eun1.devtunnels.ms",
 })
 
 // токен цеплялся ко всем запросам 
