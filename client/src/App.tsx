@@ -4,7 +4,6 @@ import { login, me, register, type User } from './api'
 import './App.css'
 
 type Mode = 'login' | 'register'
-type ChatMessage = { user: string; text: string }
 type StreamStatus = 'connecting' | 'live' | 'offline'
 
 const statusText: Record<StreamStatus, string> = {
@@ -13,24 +12,6 @@ const statusText: Record<StreamStatus, string> = {
   offline: 'НЕТ СИГНАЛА',
 }
 
-const isLocal =
-  window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
-
-const host = isLocal ? '127.0.0.1' : window.location.hostname
-
-// Укажите здесь порт вашего медиасервера для HLS (обычно 8888 для MediaMTX или 8000 для Node-Media-Server)
-const HLS_PORT = 8888
-
-function getServiceUrl(port: number, protocol: 'http' | 'ws') {
-  if (isLocal) {
-    return `${protocol}://${host}:${port}`
-  }
-  const secureProtocol = protocol === 'ws' ? 'wss' : 'https'
-  const tunnelHost = host.replace(/-\d+\./, `-${port}.`)
-  return `${secureProtocol}://${tunnelHost}`
-}
-
-// OBS подключается напрямую к медиасерверу, минуя devtunnels.ms
 const rtmpServer = 'rtmp://127.0.0.1:1935/live'
 
 function makeStreamKey(id: number) {
@@ -56,16 +37,12 @@ function App() {
   const [notice, setNotice] = useState('')
   const [busy, setBusy] = useState(false)
 
-  const [messages, setMessages] = useState<ChatMessage[]>([])
-  const [chatInput, setChatInput] = useState('')
-  const [wsConnected, setWsConnected] = useState(false)
-  const wsRef = useRef<WebSocket | null>(null)
-  const messagesEndRef = useRef<HTMLDivElement | null>(null)
-
   const [streamKey, setStreamKey] = useState('')
   const [streamStatus, setStreamStatus] = useState<StreamStatus>('connecting')
   const [retry, setRetry] = useState(0)
   const videoRef = useRef<HTMLVideoElement | null>(null)
+  const hlsRef = useRef<Hls | null>(null)
+  const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   useEffect(() => {
     if (!token) {
@@ -84,90 +61,67 @@ function App() {
     if (user) setStreamKey(makeStreamKey(user.id))
   }, [user])
 
-  useEffect(() => {
-    if (!token || !user) return
-
-    const ws = new WebSocket(`${getServiceUrl(8080, 'ws')}/ws?token=${encodeURIComponent(token)}`)
-    wsRef.current = ws
-
-    ws.onopen = () => setWsConnected(true)
-    ws.onclose = () => setWsConnected(false)
-    ws.onmessage = (event) => {
-      try {
-        const msg: ChatMessage = JSON.parse(event.data)
-        setMessages((prev) => [...prev, msg])
-      } catch {
-        setMessages((prev) => prev)
-      }
-    }
-
-    return () => {
-      ws.close()
-      wsRef.current = null
-    }
-  }, [token, user])
-
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
-  }, [messages])
-
-  const hlsUrl = `${getServiceUrl(HLS_PORT, 'http')}/live/${streamKey}/index.m3u8`
+  const isLocal = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1'
+  const hlsHost = isLocal ? '127.0.0.1' : window.location.hostname
+  const hlsUrl = `http://${hlsHost}:8888/live/${streamKey}/index.m3u8`
 
   useEffect(() => {
     const video = videoRef.current
     if (!user || !streamKey || !video) return
 
     setStreamStatus('connecting')
-    let hls: Hls | null = null
-    let retryTimer: ReturnType<typeof setTimeout> | null = null
-
-    const scheduleRetry = () => {
-      setStreamStatus('offline')
-      retryTimer = setTimeout(() => setRetry((n) => n + 1), 4000)
-    }
 
     const onLoaded = () => setStreamStatus('live')
 
-    if (Hls.isSupported()) {
-      hls = new Hls({ lowLatencyMode: true })
-      hls.loadSource(hlsUrl)
-      hls.attachMedia(video)
-      hls.on(Hls.Events.MANIFEST_PARSED, () => {
-        setStreamStatus('live')
-        void video.play().catch(() => {})
-      })
-      hls.on(Hls.Events.ERROR, (_event, data) => {
-        if (data.fatal) {
-          hls?.destroy()
-          hls = null
-          scheduleRetry()
-        }
-      })
-    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-      video.src = hlsUrl
-      video.addEventListener('loadedmetadata', onLoaded)
-      video.addEventListener('error', scheduleRetry)
-      void video.play().catch(() => {})
-    } else {
+    const scheduleRetry = () => {
       setStreamStatus('offline')
+      if (retryTimerRef.current) clearTimeout(retryTimerRef.current)
+      retryTimerRef.current = setTimeout(() => {
+        hlsRef.current?.destroy()
+        hlsRef.current = null
+        start()
+      }, 4000)
     }
 
+    const start = () => {
+      if (!video) return
+      if (Hls.isSupported()) {
+        hlsRef.current = new Hls({ lowLatencyMode: true })
+        hlsRef.current.loadSource(hlsUrl)
+        hlsRef.current.attachMedia(video)
+        hlsRef.current.on(Hls.Events.MANIFEST_PARSED, () => {
+          setStreamStatus('live')
+          void video.play().catch(() => {})
+        })
+        hlsRef.current.on(Hls.Events.ERROR, (_event, data) => {
+          if (data.fatal) {
+            hlsRef.current?.destroy()
+            hlsRef.current = null
+            scheduleRetry()
+          }
+        })
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        video.src = hlsUrl
+        video.addEventListener('loadedmetadata', onLoaded)
+        video.addEventListener('error', scheduleRetry)
+        void video.play().catch(() => {})
+      } else {
+        setStreamStatus('offline')
+      }
+    }
+
+    start()
+
     return () => {
-      if (retryTimer) clearTimeout(retryTimer)
-      hls?.destroy()
+      if (retryTimerRef.current) clearTimeout(retryTimerRef.current)
+      hlsRef.current?.destroy()
+      hlsRef.current = null
       video.removeEventListener('loadedmetadata', onLoaded)
       video.removeEventListener('error', scheduleRetry)
       video.removeAttribute('src')
       video.load()
     }
-  }, [hlsUrl, retry, user, streamKey])
-
-  const sendMessage = (e: FormEvent) => {
-    e.preventDefault()
-    if (!chatInput.trim() || !wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return
-    wsRef.current.send(JSON.stringify({ text: chatInput.trim() }))
-    setChatInput('')
-  }
+  }, [hlsUrl, user, retry])
 
   const submit = async (e: FormEvent) => {
     e.preventDefault()
@@ -194,8 +148,6 @@ function App() {
     setToken(null)
     setUser(null)
     setPassword('')
-    setMessages([])
-    setNotice('')
   }
 
   if (token && !user) {
@@ -261,41 +213,11 @@ function App() {
                   <input value={streamKey} onChange={(e) => setStreamKey(e.target.value)} />
                   <button className="outline-btn" onClick={() => copy(streamKey)}>Копировать</button>
                 </div>
-                <p className="hint">Скопируйте сервер и ключ в OBS → Настройки → Вещание → Сервис: Настраиваемый.</p>
+                <p className="hint">В OBS укажите тот же ключ потока.</p>
               </div>
               {notice && <p className="notice-line">{notice}</p>}
             </div>
           </section>
-
-          <aside className="card chat-card">
-            <div className="chat-head">
-              <h2>Чат стрима</h2>
-              <span className={wsConnected ? 'chat-online' : 'chat-offline'}>
-                {wsConnected ? 'Подключено' : 'Отключено'}
-              </span>
-            </div>
-            <div className="messages">
-              {messages.length === 0 ? (
-                <p className="empty">Сообщений пока нет...</p>
-              ) : (
-                messages.map((m, i) => (
-                  <div className="message" key={i}>
-                    <b>{m.user}:</b> <span>{m.text}</span>
-                  </div>
-                ))
-              )}
-              <div ref={messagesEndRef} />
-            </div>
-            <form className="chat-form" onSubmit={sendMessage}>
-              <input
-                type="text"
-                value={chatInput}
-                onChange={(e) => setChatInput(e.target.value)}
-                placeholder="Написать в чат..."
-              />
-              <button type="submit" className="solid-btn">➤</button>
-            </form>
-          </aside>
         </main>
       </div>
     )
